@@ -26,12 +26,17 @@ class BatchedAgentManager(object):
         self.batched_agents = []
         self.n_procs = 0
         self.current_obs = []
+        self.pending_obs = {}
+        self.current_pids = []
+        self.current_actions = {}
+        self.current_log_probs = {}
         self.average_reward = None
         self.cumulative_timesteps = 0
         self.min_inference_size = min_inference_size
         self.ep_rews = [] 
-        self.trajectories = {}
+        self.trajectory_map = {}
         self.prev_time = 0
+        self.pending_step_calls = []
 
     def collect_timesteps(self, n):
         """
@@ -66,7 +71,7 @@ class BatchedAgentManager(object):
             n_collected += self._step()
 
         # Organize our new timesteps into the appropriate lists.
-        for trajectory in self.trajectories:
+        for trajectory in self.trajectory_map.values():
             trajectories = trajectory.get_all()
             if len(trajectories) == 0:
                 continue
@@ -117,46 +122,61 @@ class BatchedAgentManager(object):
 
         if len(np.shape(self.current_obs)) == 2:
             self.current_obs = np.expand_dims(self.current_obs, 1)
-        shape = np.shape(self.current_obs)
 
-        actions, log_probs = self.policy.get_action(np.stack(self.current_obs, axis=1))
-        actions = actions.view((shape[0], shape[1], -1)).numpy()
-        log_probs = log_probs.view((shape[0], shape[1], -1)).numpy()
 
-        results = ray.get([agent.step.remote(actions[i]) for i, agent in enumerate(self.batched_agents)])
-        prev_obs = self.current_obs
+        if len(self.current_obs) > 0:
+            shape = np.shape(self.current_obs)
+
+            actions, log_probs = self.policy.get_action(np.stack(self.current_obs, axis=1))
+            actions = actions.view((shape[0], shape[1], -1)).numpy()
+            log_probs = log_probs.view((shape[0], shape[1], -1)).numpy()
+
+            actions_ref = ray.put(actions)
+
+            for i, pid in enumerate(self.current_pids):
+                self.pending_step_calls.append(self.batched_agents[pid].step.remote(actions_ref, i))
+                self.current_actions[pid] = actions[i]
+                self.current_log_probs[pid] = log_probs[i]
+                self.pending_obs[pid] = np.asarray(self.current_obs[i])
+
+        results, unfinished = ray.wait(self.pending_step_calls, num_returns=self.min_inference_size, timeout=0) 
+        
+        self.pending_step_calls = unfinished
+
         self.current_obs = []
+        self.current_pids = []
         
         n_collected = 0
-
-        for i, trajectory in enumerate(self.trajectories):
-            action = actions[i]
-            log_prob = log_probs[i]
-            state = np.asarray(prev_obs[i])
-            next_state, reward, done = results[i]
+        
+        for result in ray.get(results):
+            pid, next_state, reward, done = result
+            action = self.current_actions[pid]
+            log_prob = self.current_log_probs[pid]
+            state = self.pending_obs[pid]
             
             if type(reward) in (list, tuple, np.ndarray):
                 n_collected += len(reward)
-                for j in range(len(reward)):
-                    if j >= len(self.ep_rews[i]):
-                        self.ep_rews[i].append(reward[j])
+                for i in range(len(reward)):
+                    if i >= len(self.ep_rews[pid]):
+                        self.ep_rews[pid].append(reward[i])
                     else:
-                        self.ep_rews[i][j] += reward[j]
+                        self.ep_rews[pid][i] += reward[i]
             else:
                 n_collected += 1
-                self.ep_rews[i][0] += reward
+                self.ep_rews[pid][0] += reward
             
             if done:
                 if self.average_reward is None:
-                    self.average_reward = self.ep_rews[i][0]
+                    self.average_reward = self.ep_rews[pid][0]
                 else:
-                    for ep_rew in self.ep_rews[i]:
+                    for ep_rew in self.ep_rews[pid]:
                         self.average_reward = (
                             self.average_reward * 0.9 + ep_rew * 0.1
                         )
                 
-                self.ep_rews[i] = [0]
+                self.ep_rews[pid] = [0]
                 
+            trajectory = self.trajectory_map[pid]
             trajectory.action = action
             trajectory.log_prob = log_prob
             trajectory.state = state
@@ -165,6 +185,7 @@ class BatchedAgentManager(object):
             trajectory.done = done
             trajectory.update()
             self.current_obs.append(next_state)
+            self.current_pids.append(pid)
 
         return n_collected
 
@@ -175,6 +196,7 @@ class BatchedAgentManager(object):
         """
 
         self.current_obs = ray.get([agent.reset.remote() for agent in self.batched_agents])
+        self.current_pids = list(range(self.n_procs))
 
     def _get_env_shapes(self):
         """
@@ -211,16 +233,18 @@ class BatchedAgentManager(object):
             render_this_proc = i == 0 and render
             self.batched_agents.append(
                 BatchedAgent.remote(
-                build_env_fn,
-                self.seed + i,
-                render_this_proc,
-                render_delay
-            ))
+                    i,
+                    build_env_fn,
+                    self.seed + i,
+                    render_this_proc,
+                    render_delay
+                )
+            )
             if spawn_delay is not None:
                 time.sleep(spawn_delay)
 
         self.ep_rews = [[0] for _ in range(n_processes)]
-        self.trajectories = [BatchedTrajectory() for _ in range(n_processes)]
+        self.trajectory_map = { pid: BatchedTrajectory() for pid in range(n_processes) }
         self._get_initial_states()
         return self._get_env_shapes()
 

@@ -5,12 +5,13 @@ import gym
 
 @ray.remote
 class BatchedAgent(object):
-    def __init__(self, build_env_fn, seed, render, render_delay: Union[float, None]):
+    def __init__(self, idx, build_env_fn, seed, render, render_delay: Union[float, None]):
         """
         :param seed: Seed for environment and action space randomization.
         :param render: Whether the environment will be rendered every timestep.
         :param render_delay: Amount of time in seconds to delay between steps while rendering.
         """
+        self.idx = idx
         self.env = build_env_fn()
         self.seed = seed
         self.render=render
@@ -19,7 +20,8 @@ class BatchedAgent(object):
         # Seed everything.
         self.env.action_space.seed(seed)
     
-    def step(self, action):
+    def step(self, actions, action_index):
+        action = actions[action_index]
         obs, rew, done, _ = self.env.step(action)
         if done:
             obs = self.env.reset()
@@ -29,7 +31,7 @@ class BatchedAgent(object):
             if self.render_delay is not None:
                 time.sleep(self.render_delay)
 
-        return obs, rew, done
+        return self.idx, obs, rew, done
 
     
     def reset(self):
