@@ -5,6 +5,7 @@ gym-notices==0.0.8
 Jinja2>3.0
 mpmath>1.0
 numpy>1.21
+ray==2.6.3
 sympy>1.10
 torch>1.13
 typing_extensions>4.6
