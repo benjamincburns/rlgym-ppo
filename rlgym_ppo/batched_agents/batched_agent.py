@@ -1,6 +1,8 @@
+from typing import Tuple
+from threading import Condition
+from queue import Queue
 
-
-def batched_agent_process(proc_id, pipe, seed, render, render_delay):
+def batched_agent_process(proc_id: int, notify_handle: Condition, recv_queue: Queue, send_queue: Queue, seed: float, render: bool, render_delay: float):
     """
     Function to interact with an environment and communicate with the learner through a pipe.
 
@@ -24,10 +26,10 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
 
     PACKED_ENV_STEP_DATA_HEADER = comm_consts.pack_message(comm_consts.ENV_STEP_DATA_HEADER)
     header_len = comm_consts.HEADER_LEN
-
+    
     # Wait for initialization data from the learner.
     while env is None:
-        data = pipe.recv()
+        data = recv_queue.get()
         if data[0] == "initialization_data":
             build_env_fn = data[1]
 
@@ -49,7 +51,10 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
 
     message_floats = comm_consts.ENV_RESET_STATE_HEADER + [n_elements_in_state_shape] + state_shape
     packed_message_floats = comm_consts.pack_message(message_floats)
-    pipe.send_bytes(packed_message_floats + obs_buffer)
+    notify_handle.acquire()
+    send_queue.put(packed_message_floats + obs_buffer)
+    notify_handle.notify_all()
+    notify_handle.release()
 
     action_buffer = None
     action_slice_size = 0
@@ -60,7 +65,7 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
     # Primary interaction loop.
     try:
         while True:
-            message_bytes = pipe.recv_bytes()
+            message_bytes = recv_queue.get()
             message = frombuffer(message_bytes, dtype=np.float32)
             # message = byte_headers.unpack_message(message_bytes)
             header = message[:header_len]
@@ -94,7 +99,7 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
                 message_floats = [done, n_elements_in_state_shape] + state_shape + rew
                 packed = pack("%sf" % len(message_floats), *message_floats)
 
-                pipe.send_bytes(PACKED_ENV_STEP_DATA_HEADER + packed + obs_buffer)
+                send_queue.put(PACKED_ENV_STEP_DATA_HEADER + packed + obs_buffer)
 
                 if render:
                     env.render()
@@ -119,7 +124,10 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
 
                 env_shape = float(np.prod(env.observation_space.shape))
                 message_floats = ENV_SHAPES_HEADER + [env_shape, n_acts, action_space_type]
-                pipe.send_bytes(pack("%sf" % len(message_floats), *message_floats))
+                notify_handle.acquire()
+                send_queue.put(pack("%sf" % len(message_floats), *message_floats))
+                notify_handle.notify_all()
+                notify_handle.release()
 
             elif header[0] == STOP_MESSAGE_HEADER[0]:
                 break
@@ -130,7 +138,6 @@ def batched_agent_process(proc_id, pipe, seed, render, render_delay):
         print("ERROR IN BATCHED AGENT LOOP")
         traceback.print_exc()
 
-    # Close the pipe and local environment instance.
+    # Close the local environment instance.
     finally:
-        pipe.close()
         env.close()

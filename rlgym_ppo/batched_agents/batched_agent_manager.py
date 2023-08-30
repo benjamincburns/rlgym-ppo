@@ -8,18 +8,17 @@ Description:
     the trajectories from each instance of the environment.
 """
 
-import multiprocessing as mp
 import time
 from typing import Union
-
 import numpy as np
 import torch
-
-from rlgym_ppo.batched_agents import BatchedTrajectory
+from rlgym_ppo.batched_agents import BatchedTrajectory, comm_consts
 from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
-from rlgym_ppo.batched_agents import comm_consts
+from threading import Thread, Condition
+from queue import Queue
 
-
+SEND_QUEUE = 0
+RECV_QUEUE = 1
 class BatchedAgentManager(object):
     def __init__(self, policy, min_inference_size=8, seed=123):
         self.policy = policy
@@ -153,14 +152,14 @@ class BatchedAgentManager(object):
 
         step = 0
         for proc_id, dim_0 in zip(self.current_pids, dimensions):
-            process, parent_end, child_end = self.processes[proc_id]
+            _, send_queue, _, _ = self.processes[proc_id]
             stop = step+dim_0
 
             state = inference_batch[step:stop]
             action = actions[step:stop]
             logp = log_probs[step:stop]
 
-            parent_end.send_bytes(comm_consts.pack_message(comm_consts.POLICY_ACTIONS_HEADER) + action.tobytes())
+            send_queue.put(comm_consts.pack_message(comm_consts.POLICY_ACTIONS_HEADER) + action.tobytes())
 
             self.trajectory_map[proc_id].action = action
             self.trajectory_map[proc_id].log_prob = logp
@@ -188,16 +187,16 @@ class BatchedAgentManager(object):
         while n_collected < n_obs_per_inference:
             proc_package = processes[buffer_ptr]
             proc_id = buffer_ptr
-            process, parent_end, child_end = proc_package
+            _, _, recv_queue, notify_handle = proc_package
             
             buffer_ptr += 1
             if buffer_ptr >= n_procs:
                 buffer_ptr = 0
                 
-            if not parent_end.poll():
+            if recv_queue.empty():
                 continue
 
-            available_data = parent_end.recv_bytes()
+            available_data = recv_queue.get()
             message = np.frombuffer(available_data, dtype=np.float32)
             header = message[:comm_consts.HEADER_LEN]
             message = message[comm_consts.HEADER_LEN:]
@@ -256,11 +255,13 @@ class BatchedAgentManager(object):
         self.current_obs = []
         self.current_pids = []
         for proc_id, proc_package in self.processes.items():
-            process, parent_end, child_end = proc_package
-            while not parent_end.poll():
-                time.sleep(0.01)
+            _, _, recv_queue, notify_handle = proc_package
+            
+            if recv_queue.empty():
+                notify_handle.acquire()
+                notify_handle.wait()
 
-            available_data = parent_end.recv_bytes()
+            available_data = recv_queue.get()
             message = comm_consts.unpack_message(available_data)
 
             header = message[:comm_consts.HEADER_LEN]
@@ -282,18 +283,20 @@ class BatchedAgentManager(object):
         Retrieve environment observation and action space shapes from one of the connected environment processes.
         :return: A tuple containing observation shape, action shape, and action space type.
         """
-        process, parent_end, child_end = self.processes[0]
+        _, send_queue, recv_queue, notify_handle = self.processes[0]
         request_msg = comm_consts.pack_message(comm_consts.ENV_SHAPES_HEADER)
-        parent_end.send_bytes(request_msg)
+        send_queue.put(request_msg)
 
         obs_shape, action_shape, action_space_type = -1, -1, -1
         done = False
 
         while not done:
-            while not parent_end.poll():
-                time.sleep(0.1)
+            if recv_queue.empty():
+                notify_handle.acquire()
+                notify_handle.wait()
 
-            available_data = parent_end.recv_bytes()
+            available_data = recv_queue.get()
+            print("env_shapes collected")
             message = comm_consts.unpack_message(available_data)
             header = message[:comm_consts.HEADER_LEN]
             data = message[comm_consts.HEADER_LEN:]
@@ -314,30 +317,25 @@ class BatchedAgentManager(object):
     ):
         """
         Initialize and spawn environment processes.
-
-        :param n_processes: Number of processes to spawn.
-        :param build_env_fn: A function to build the environment for each process.
-        :param spawn_delay: Delay between spawning processes. Defaults to None.
-        :param render: Whether an environment should be rendered while collecting timesteps.
-        :param render_delay: A period in seconds to delay a process between frames while rendering.
-        :return: A tuple containing observation shape, action shape, and action space type.
         """
-
-        can_fork = "forkserver" in mp.get_all_start_methods()
-        start_method = "forkserver" if can_fork else "spawn"
-        context = mp.get_context(start_method)
         self.n_procs = n_processes
+        self.queues = [(Queue(), Queue()) for _ in range(n_processes)]
 
         for i in range(n_processes):
             render_this_proc = i == 0 and render
-            parent_end, child_end = context.Pipe()
-            process = context.Process(
+            
+            # allows the child to directly wake up the parent when data has been sent
+            # useful for coordinating request/response cycles w/o use of time.sleep()
+            notify_handle = Condition()
+            thread = Thread(
                 target=batched_agent_process,
-                args=(i, child_end, self.seed + i, render_this_proc, render_delay),
+                # we want to use the parent's send as the child's recv and vice-versa
+                args=(i, notify_handle, self.queues[i][SEND_QUEUE], self.queues[i][RECV_QUEUE], self.seed + i, render_this_proc, render_delay),
             )
-            process.start()
-            parent_end.send(("initialization_data", build_env_fn))
-            self.processes[i] = (process, parent_end, child_end)
+
+            thread.start()
+            self.queues[i][SEND_QUEUE].put(("initialization_data", build_env_fn))
+            self.processes[i] = (thread, self.queues[i][SEND_QUEUE], self.queues[i][RECV_QUEUE], notify_handle)
             if spawn_delay is not None:
                 time.sleep(spawn_delay)
 
@@ -352,23 +350,13 @@ class BatchedAgentManager(object):
         """
         Clean up resources and terminate processes.
         """
-        for proc_id, proc_package in self.processes.items():
-            process, parent_end, child_end = proc_package
+        for _, proc_package in self.processes.items():
+            thread, send_queue, _, _ = proc_package
             try:
-                parent_end.send_bytes(comm_consts.pack_message(comm_consts.STOP_MESSAGE_HEADER))
+                send_queue.put(comm_consts.pack_message(comm_consts.STOP_MESSAGE_HEADER))
             except:
                 import traceback
-                print("Failed to send stop signal to child process!")
+                print("Failed to send stop signal to child thread!")
                 traceback.print_exc()
-            try:
-                parent_end.close()
-            except:
-                print("Unable to close parent connection")
-            try:
-                child_end.close()
-            except:
-                print("Unable to close child connection")
-            try:
-                process.join()
-            except:
-                print("Unable to join process")
+
+            thread.join()
