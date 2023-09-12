@@ -15,6 +15,8 @@ import random
 import shutil
 import time
 from typing import Callable, Union, Tuple
+from queue import Queue
+from threading import Thread, Condition
 
 import numpy as np
 import torch
@@ -229,90 +231,109 @@ class Learner(object):
         kb = KBHit()
         print("Press (p) to pause (c) to checkpoint, (q) to checkpoint and quit (after next iteration)\n")
 
-        # While the number of timesteps we have collected so far is less than the
-        # amount we are allowed to collect.
-        while self.agent.cumulative_timesteps < self.timestep_limit:
+        timestep_queue = Queue()
+        batch_ready_condition = Condition()
 
-            # if we're using different devices for inference and backprop, we need to
-            # copy the current policy to the inference device
-            if self.device != self.inference_device:
-                self.agent.policy = self.ppo_learner.policy.clone(to=self.inference_device)
+        collection_thread = Thread(target=self.agent.collect_timesteps, args=(self.ts_per_epoch, timestep_queue, batch_ready_condition))
+        collection_thread.start()
 
-            epoch_start = time.perf_counter()
-            report = {}
+        try:
+            # While the number of timesteps we have collected so far is less than the
+            # amount we are allowed to collect.
+            while self.agent.cumulative_timesteps < self.timestep_limit:
 
-            # Collect the desired number of timesteps from our agent.
-            experience, collected_metrics, steps_collected, collection_time = self.agent.collect_timesteps(
-                self.ts_per_epoch
-            )
+                # if we're using different devices for inference and backprop, we need to
+                # copy the current policy to the inference device
+                if self.device != self.inference_device:
+                    self.agent.policy = self.ppo_learner.policy.clone(to=self.inference_device)
 
-            if self.metrics_logger is not None:
-                self.metrics_logger.report_metrics(collected_metrics, self.wandb_run, self.agent.cumulative_timesteps)
+                epoch_start = time.perf_counter()
+                report = {}
 
-            # Add the new experience to our buffer and compute the various
-            # reinforcement learning quantities we need to
-            # learn from (advantages, values, returns).
-            self.add_new_experience(experience)
 
-            # Let PPO compute updates using our experience buffer.
-            ppo_report = self.ppo_learner.learn(self.experience_buffer)
-            epoch_stop = time.perf_counter()
-            epoch_time = epoch_stop - epoch_start
+                with batch_ready_condition:
 
-            # Report variables we care about.
-            report.update(ppo_report)
-            if self.epoch < 1:
-                report["Value Function Loss"] = np.nan
+                    if timestep_queue.empty():
+                        # wait for a batch to be ready
+                        batch_ready_condition.wait()
 
-            report["Cumulative Timesteps"] = self.agent.cumulative_timesteps
-            report["Total Iteration Time"] = epoch_time
-            report["Timesteps Collected"] = steps_collected
-            report["Timestep Collection Time"] = collection_time
-            report["Timestep Consumption Time"] = epoch_time - collection_time
-            report["Collected Steps per Second"] = steps_collected / collection_time
-            report["Overall Steps per Second"] = steps_collected / epoch_time
+                assert(not timestep_queue.empty())
 
-            self.ts_since_last_save += steps_collected
-            if self.agent.average_reward is not None:
-                report["Policy Reward"] = self.agent.average_reward
-            else:
-                report["Policy Reward"] = np.nan
+                # Collect the desired number of timesteps from our agent.
+                experience, collected_metrics, steps_collected, collection_time = timestep_queue.get()
 
-            # Log to wandb and print to the console.
-            reporting.report_metrics(
-                loggable_metrics=report, debug_metrics=None, wandb_run=self.wandb_run
-            )
+                if self.metrics_logger is not None:
+                    self.metrics_logger.report_metrics(collected_metrics, self.wandb_run, self.agent.cumulative_timesteps)
 
-            report.clear()
-            ppo_report.clear()
+                # Add the new experience to our buffer and compute the various
+                # reinforcement learning quantities we need to
+                # learn from (advantages, values, returns).
+                self.add_new_experience(experience)
 
-            if "cuda" in self.device or "cuda" in self.inference_device:
-                torch.cuda.empty_cache()
+                # Let PPO compute updates using our experience buffer.
+                ppo_report = self.ppo_learner.learn(self.experience_buffer)
+                epoch_stop = time.perf_counter()
+                epoch_time = epoch_stop - epoch_start
 
-            # Check if keyboard press
-            # p: pause, any key to resume
-            # c: checkpoint
-            # q: checkpoint and quit
-            if kb.kbhit():
-                c = kb.getch()
-                if c == 'p': # pause
-                    print("Paused, press any key to resume")
-                    while True:
-                        if kb.kbhit():
-                            break
-                if c in ('c', 'q'):
+                if "cuda" in self.device or "cuda" in self.inference_device:
+                    torch.cuda.empty_cache()
+
+                # Report variables we care about.
+                report.update(ppo_report)
+                if self.epoch < 1:
+                    report["Value Function Loss"] = np.nan
+
+                report["Cumulative Timesteps"] = self.agent.cumulative_timesteps
+                report["Total Iteration Time"] = epoch_time
+                report["Timesteps Collected"] = steps_collected
+                report["Timestep Collection Time"] = collection_time
+                report["Timestep Consumption Time"] = epoch_time
+                report["Collected Steps per Second"] = steps_collected / collection_time
+                report["Overall Steps per Second"] = steps_collected / epoch_time
+
+                self.ts_since_last_save += steps_collected
+                if self.agent.average_reward is not None:
+                    report["Policy Reward"] = self.agent.average_reward
+                else:
+                    report["Policy Reward"] = np.nan
+
+                # Log to wandb and print to the console.
+                reporting.report_metrics(
+                    loggable_metrics=report, debug_metrics=None, wandb_run=self.wandb_run
+                )
+
+                report.clear()
+                ppo_report.clear()
+
+                if "cuda" in self.device:
+                    torch.cuda.empty_cache()
+
+                # Check if keyboard press
+                # p: pause, any key to resume
+                # c: checkpoint
+                # q: checkpoint and quit
+                if kb.kbhit():
+                    c = kb.getch()
+                    if c == 'p': # pause
+                        print("Paused, press any key to resume")
+                        while True:
+                            if kb.kbhit():
+                                break
+                    if c in ('c', 'q'):
+                        self.save(self.agent.cumulative_timesteps)
+                    if c == 'q':
+                        return
+                    if c in ('c', 'p'):
+                        print("Resuming...\n")
+
+                # Save if we've reached the next checkpoint timestep.
+                if self.ts_since_last_save >= self.save_every_ts:
                     self.save(self.agent.cumulative_timesteps)
-                if c == 'q':
-                    return
-                if c in ('c', 'p'):
-                    print("Resuming...\n")
+                    self.ts_since_last_save = 0
 
-            # Save if we've reached the next checkpoint timestep.
-            if self.ts_since_last_save >= self.save_every_ts:
-                self.save(self.agent.cumulative_timesteps)
-                self.ts_since_last_save = 0
-
-            self.epoch += 1
+                self.epoch += 1
+        finally:
+            self.agent.stop_collecting()
 
     @torch.no_grad()
     def add_new_experience(self, experience):
