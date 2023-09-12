@@ -14,6 +14,7 @@ import selectors
 import socket
 import time
 from typing import Union
+from threading import Condition
 
 import numpy as np
 import torch
@@ -64,6 +65,7 @@ class BatchedAgentManager(object):
         self.trajectory_map = {}
         self.prev_time = 0
         self.completed_trajectories = []
+        self._collecting = False
 
         self.n_procs = 0
         import struct
@@ -73,11 +75,16 @@ class BatchedAgentManager(object):
             *comm_consts.POLICY_ACTIONS_HEADER,
         )
 
-    def collect_timesteps(self, n):
+    def stop_collecting(self):
+        self._collecting = False
+
+    def collect_timesteps(self, n, results_queue, batch_ready_condition: Condition):
         """
         Collect a specified number of timesteps from the environment.
 
         :param n: Number of timesteps to collect.
+        :param results_queue: A queue to put the collected data into.
+        :param batch_ready_condition: A condition to signal when the batch is ready.
         :return: A tuple containing the collected data arrays and additional information.
                 - states (np.ndarray): Array of states.
                 - actions (np.ndarray): Array of actions.
@@ -91,6 +98,7 @@ class BatchedAgentManager(object):
         """
 
         t1 = time.perf_counter()
+        self._collecting = True
         states = []
         actions = []
         log_probs = []
@@ -103,8 +111,8 @@ class BatchedAgentManager(object):
         n_procs = max(1, len(list(self.processes.keys())))
         n_obs_per_inference = min(self.min_inference_size, n_procs)
         collected_metrics = []
-        # Collect n timesteps.
-        while n_collected < n:
+        # Collect batches of n timesteps.
+        while self._collecting:
             # Send actions for the current observations and collect new states to act on. Note that the next states
             # will not necessarily be from the environments that we just sent actions to. Whatever timestep data happens
             # to be lying around in the buffer will be collected and used in the next inference step.
@@ -123,54 +131,73 @@ class BatchedAgentManager(object):
                     self.next_obs[pid] = None
 
             self._sync_trajectories()
+            
+            if n_collected >= n:
 
-        # Organize our new timesteps into the appropriate lists.
-        for pid, trajectory in self.trajectory_map.items():
-            self.completed_trajectories.append(trajectory)
-            self.trajectory_map[pid] = BatchedTrajectory()
+                # Organize our new timesteps into the appropriate lists.
+                for pid, trajectory in self.trajectory_map.items():
+                    self.completed_trajectories.append(trajectory)
+                    self.trajectory_map[pid] = BatchedTrajectory()
 
-        for trajectory in self.completed_trajectories:
-            trajectories = trajectory.get_all()
-            if len(trajectories) == 0:
-                continue
+                for trajectory in self.completed_trajectories:
+                    trajectories = trajectory.get_all()
+                    if len(trajectories) == 0:
+                        continue
 
-            for traj in trajectories:
-                (
-                    trajectory_states,
-                    trajectory_actions,
-                    trajectory_log_probs,
-                    trajectory_rewards,
-                    trajectory_next_states,
-                    trajectory_dones,
-                ) = traj
-                trajectory_truncated = [0 for _ in range(len(trajectory_dones))]
-                trajectory_truncated[-1] = 1 if trajectory_dones[-1] == 0 else 0
-                states += trajectory_states
-                actions += trajectory_actions
-                log_probs += trajectory_log_probs
-                rewards += trajectory_rewards
-                next_states += trajectory_next_states
-                dones += trajectory_dones
-                truncated += trajectory_truncated
+                    for traj in trajectories:
+                        (
+                            trajectory_states,
+                            trajectory_actions,
+                            trajectory_log_probs,
+                            trajectory_rewards,
+                            trajectory_next_states,
+                            trajectory_dones,
+                        ) = traj
+                        trajectory_truncated = [0 for _ in range(len(trajectory_dones))]
+                        trajectory_truncated[-1] = 1 if trajectory_dones[-1] == 0 else 0
+                        states += trajectory_states
+                        actions += trajectory_actions
+                        log_probs += trajectory_log_probs
+                        rewards += trajectory_rewards
+                        next_states += trajectory_next_states
+                        dones += trajectory_dones
+                        truncated += trajectory_truncated
 
-        self.cumulative_timesteps += n_collected
-        t2 = time.perf_counter()
-        self.completed_trajectories = []
+                self.cumulative_timesteps += n_collected
+                self.completed_trajectories = []
 
-        return (
-            (
-                np.asarray(states),
-                np.asarray(actions),
-                np.asarray(log_probs),
-                np.asarray(rewards),
-                np.asarray(next_states),
-                np.asarray(dones),
-                np.asarray(truncated),
-            ),
-            collected_metrics,
-            n_collected,
-            t2 - t1,
-        )
+                with batch_ready_condition:
+                    t2 = time.perf_counter()
+                    results_queue.put((
+                        (
+                            np.asarray(states),
+                            np.asarray(actions),
+                            np.asarray(log_probs),
+                            np.asarray(rewards),
+                            np.asarray(next_states),
+                            np.asarray(dones),
+                            np.asarray(truncated),
+                        ),
+                        collected_metrics,
+                        n_collected,
+                        t2 - t1,
+                    ))
+                    batch_ready_condition.notify_all()
+
+                # reinitialize before continuing on
+                t1 = t2
+                states = []
+                actions = []
+                log_probs = []
+                rewards = []
+                next_states = []
+                dones = []
+                truncated = []
+
+                n_collected = 0
+                n_procs = max(1, len(list(self.processes.keys())))
+                n_obs_per_inference = min(self.min_inference_size, n_procs)
+                collected_metrics = []
 
     def _sync_trajectories(self):
         for pid, trajectory in self.trajectory_map.items():
