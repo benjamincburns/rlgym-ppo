@@ -404,7 +404,7 @@ class BatchedAgentManager(object):
 
         return int(obs_shape), int(action_shape), int(action_space_type)
 
-    def init_processes(
+    def init_environments(
         self,
         n_processes,
         build_env_fn,

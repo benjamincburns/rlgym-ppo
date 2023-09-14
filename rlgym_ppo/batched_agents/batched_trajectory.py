@@ -19,6 +19,9 @@ class BatchedTrajectory(object):
         self.done = None
         self.complete_timesteps = []
 
+    def add_timestep(self, state, action, log_prob, reward, next_state, done):
+        self.complete_timesteps.append((state, action, log_prob, reward, next_state, done))
+
     def update(self):
         """
         Function to check if the current timestep data is ready to be appended to the sequence we are tracking.
